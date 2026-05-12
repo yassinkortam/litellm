@@ -1,0 +1,20 @@
+# Minimal proxy config for the free-threading benchmark.
+#
+# Points a single virtual model `mock-gpt` at the local mock_upstream.py.
+# The benchmark orchestrator overrides the api_base via env if needed.
+
+model_list:
+  - model_name: mock-gpt
+    litellm_params:
+      model: openai/mock-gpt
+      api_base: ${MOCK_UPSTREAM_URL:-http://127.0.0.1:18080/v1}
+      api_key: sk-mock
+
+litellm_settings:
+  drop_params: True
+  set_verbose: False
+  cache: False
+
+general_settings:
+  master_key: sk-bench
+  database_url: null

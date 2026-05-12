@@ -223,3 +223,69 @@ def test_in_memory_cache_prunes_expired_heap_entries_below_capacity():
     assert len(in_memory_cache.cache_dict) == 5
     assert len(in_memory_cache.ttl_dict) == 5
     assert len(in_memory_cache.expiration_heap) == 5
+
+
+def test_in_memory_cache_concurrent_set_get_keeps_heap_consistent():
+    """
+    Hammer the cache from many threads. Without the internal lock, the
+    expiration_heap can be corrupted on a free-threaded interpreter
+    (and even on a GIL build the read-modify-write in increment_cache
+    can lose updates). Asserts the heap invariant and no exceptions.
+    """
+    import heapq
+    import threading
+
+    cache = InMemoryCache(max_size_in_memory=128, default_ttl=60)
+    n_threads = 16
+    iters = 500
+    errors: list[BaseException] = []
+
+    def worker(tid: int) -> None:
+        try:
+            for i in range(iters):
+                k = f"k_{(tid * iters + i) % 64}"
+                cache.set_cache(key=k, value={"v": i, "tid": tid}, ttl=60)
+                cache.get_cache(key=k)
+                if i % 7 == 0:
+                    cache.increment_cache(key=f"counter_{tid % 4}", value=1)
+        except BaseException as e:  # capture, don't crash the thread
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"worker errors: {errors!r}"
+
+    heap_copy = list(cache.expiration_heap)
+    heapq.heapify(heap_copy)
+    assert (
+        heap_copy == cache.expiration_heap
+    ), "expiration_heap lost the heap invariant under concurrent writers"
+    assert len(cache.cache_dict) <= cache.max_size_in_memory
+
+
+def test_in_memory_cache_concurrent_increment_no_lost_updates():
+    """
+    Each of N threads increments the same counter M times. With the
+    lock around the read-modify-write, the final value must equal N*M.
+    """
+    import threading
+
+    cache = InMemoryCache(max_size_in_memory=128, default_ttl=60)
+    n_threads = 8
+    iters = 250
+
+    def worker() -> None:
+        for _ in range(iters):
+            cache.increment_cache(key="hot_counter", value=1)
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert cache.get_cache(key="hot_counter") == n_threads * iters
