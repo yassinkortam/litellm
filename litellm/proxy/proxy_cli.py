@@ -292,9 +292,7 @@ class ProxyInitializationHelpers:
                 _endpoint_str = (
                     f"curl --location 'http://0.0.0.0:{port}/chat/completions' \\"
                 )
-                curl_command = (
-                    _endpoint_str
-                    + """
+                curl_command = _endpoint_str + """
                 --header 'Content-Type: application/json' \\
                 --data ' {
                 "model": "gpt-3.5-turbo",
@@ -307,7 +305,6 @@ class ProxyInitializationHelpers:
                 }'
                 \n
                 """
-                )
                 print()  # noqa
                 print(  # noqa
                     '\033[1;34mLiteLLM: Test your local proxy with: "litellm --test" This runs an openai.ChatCompletion request to your proxy [In a new terminal tab]\033[0m\n'
@@ -376,6 +373,106 @@ class ProxyInitializationHelpers:
         StandaloneApplication(app=app, options=gunicorn_options).run()  # Run gunicorn
 
     @staticmethod
+    def _run_free_threaded_server(
+        host: str,
+        port: int,
+        num_workers: int,
+        uvicorn_args: dict,
+    ):
+        """
+        Run `num_workers` uvicorn servers as threads inside a single process.
+
+        This is the free-threading (no-GIL) analogue of `uvicorn --workers N`:
+        instead of N separate worker processes, N event loops run in N OS
+        threads that share one process and one listening socket. On a
+        free-threaded Python 3.13+ build (GIL disabled) the threads execute
+        Python in parallel; on a standard build they still run but the GIL
+        serializes Python execution (useful for parity testing only).
+
+        Opt-in via `--run_free_threading`.
+        See https://docs.python.org/3/howto/free-threading-python.html
+        """
+        import signal
+        import socket
+        import threading
+
+        import uvicorn
+
+        from litellm.proxy.free_threading import (
+            free_threading_status,
+            is_free_threaded,
+        )
+
+        print(free_threading_status().replace("{n}", str(num_workers)))  # noqa
+        if not is_free_threaded():
+            print(  # noqa
+                "\033[1;33mLiteLLM Proxy: --run_free_threading was requested on an "
+                "interpreter where the GIL is active. Continuing with threaded "
+                "serving anyway.\033[0m"
+            )
+
+        # One listening socket bound once, then dup()'d per thread. Every
+        # thread's event loop accepts on the same underlying socket so the OS
+        # distributes connections across loops (the in-process analogue of
+        # uvicorn's multiprocess shared-socket model). Each thread owns its own
+        # fd so one server shutting down (uvicorn closes the sockets it is given)
+        # does not invalidate the others' selectors.
+        listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listen_sock.bind((host, port))
+        listen_sock.listen(2048)
+        worker_socks = [listen_sock.dup() for _ in range(num_workers)]
+
+        # Build one Server per thread up front (in the main thread) so the
+        # signal handler can always reach every server, with no startup race.
+        config_kwargs = {k: v for k, v in uvicorn_args.items() if k != "workers"}
+        servers = [
+            uvicorn.Server(uvicorn.Config(**config_kwargs)) for _ in range(num_workers)
+        ]
+
+        def _serve(server: "uvicorn.Server", worker_sock: socket.socket) -> None:
+            # uvicorn's Server.run() builds a fresh event loop (uvloop when
+            # configured) for the calling thread and skips signal handling
+            # off the main thread.
+            server.run(sockets=[worker_sock])
+
+        print(  # noqa
+            f"\033[1;32mLiteLLM Proxy: Starting {num_workers} free-threaded "
+            f"server thread(s) on {host}:{port}\033[0m\n"
+        )
+        threads = [
+            threading.Thread(
+                target=_serve,
+                args=(servers[i], worker_socks[i]),
+                name=f"litellm-ft-worker-{i}",
+                daemon=True,
+            )
+            for i in range(num_workers)
+        ]
+        for thread in threads:
+            thread.start()
+
+        stop_event = threading.Event()
+
+        def _handle_exit(signum, frame):  # type: ignore[no-untyped-def]
+            for server in servers:
+                server.should_exit = True
+            stop_event.set()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, _handle_exit)
+
+        try:
+            while not stop_event.is_set() and any(t.is_alive() for t in threads):
+                stop_event.wait(0.5)
+        finally:
+            for server in servers:
+                server.should_exit = True
+            for thread in threads:
+                thread.join(timeout=10)
+            listen_sock.close()
+
+    @staticmethod
     def _run_ollama_serve():
         try:
             command = ["ollama", "serve"]
@@ -383,11 +480,9 @@ class ProxyInitializationHelpers:
             with open(os.devnull, "w") as devnull:
                 subprocess.Popen(command, stdout=devnull, stderr=devnull)
         except Exception as e:
-            print(  # noqa
-                f"""
+            print(f"""
                 LiteLLM Warning: proxy started with `ollama` model\n`ollama serve` failed with Exception{e}. \nEnsure you run `ollama serve`
-            """
-            )  # noqa
+            """)  # noqa  # noqa
 
     @staticmethod
     def _is_port_in_use(port):
@@ -601,6 +696,19 @@ class ProxyInitializationHelpers:
     help="Starts proxy via hypercorn, instead of uvicorn (supports HTTP/2)",
 )
 @click.option(
+    "--run_free_threading",
+    default=False,
+    is_flag=True,
+    help=(
+        "Opt-in: run --num_workers uvicorn servers as threads in a single "
+        "process (free-threading / no-GIL) instead of separate worker "
+        "processes. Best on a free-threaded Python 3.13+ build (python3.13t, "
+        "PYTHON_GIL=0). Incompatible with --run_gunicorn, --run_hypercorn, "
+        "and --reload."
+    ),
+    envvar="LITELLM_RUN_FREE_THREADING",
+)
+@click.option(
     "--ssl_keyfile_path",
     default=None,
     type=str,
@@ -713,6 +821,7 @@ def run_server(  # noqa: PLR0915
     version,
     run_gunicorn,
     run_hypercorn,
+    run_free_threading,
     ssl_keyfile_path,
     ssl_certfile_path,
     ciphers,
@@ -1069,6 +1178,12 @@ def run_server(  # noqa: PLR0915
             return
 
         running_uvicorn = run_gunicorn is False and run_hypercorn is False
+        if run_free_threading and not running_uvicorn:
+            print(  # noqa
+                "\033[1;33mLiteLLM Proxy: --run_free_threading is incompatible "
+                "with --run_gunicorn / --run_hypercorn; ignoring "
+                "--run_free_threading.\033[0m"
+            )
         uvicorn_args = ProxyInitializationHelpers._get_default_unvicorn_init_args(
             host=host,
             port=port,
@@ -1093,17 +1208,30 @@ def run_server(  # noqa: PLR0915
             if loop_type:
                 uvicorn_args["loop"] = loop_type
 
-            if reload:
-                uvicorn_args.update(
-                    ProxyInitializationHelpers._get_reload_options(config)
+            if run_free_threading:
+                if reload:
+                    print(  # noqa
+                        "\033[1;33mLiteLLM Proxy: --reload is incompatible with "
+                        "--run_free_threading; ignoring --reload.\033[0m"
+                    )
+                ProxyInitializationHelpers._run_free_threaded_server(
+                    host=host,
+                    port=port,
+                    num_workers=num_workers,
+                    uvicorn_args=uvicorn_args,
                 )
-                if config:
-                    ProxyInitializationHelpers._patch_statreload_for_config(config)
+            else:
+                if reload:
+                    uvicorn_args.update(
+                        ProxyInitializationHelpers._get_reload_options(config)
+                    )
+                    if config:
+                        ProxyInitializationHelpers._patch_statreload_for_config(config)
 
-            uvicorn.run(
-                **uvicorn_args,
-                workers=num_workers,
-            )
+                uvicorn.run(
+                    **uvicorn_args,
+                    workers=num_workers,
+                )
         elif run_gunicorn is True:
             ProxyInitializationHelpers._run_gunicorn_server(
                 host=host,

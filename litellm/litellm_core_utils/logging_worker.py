@@ -3,7 +3,8 @@
 
 import asyncio
 import contextvars
-from typing import Coroutine, Optional
+import threading
+from typing import Coroutine, Dict, Optional
 import atexit
 from typing_extensions import TypedDict
 
@@ -43,6 +44,7 @@ class LoggingWorker:
         timeout: float = LOGGING_WORKER_MAX_TIME_PER_COROUTINE,
         max_queue_size: int = LOGGING_WORKER_MAX_QUEUE_SIZE,
         concurrency: int = LOGGING_WORKER_CONCURRENCY,
+        register_atexit: bool = True,
     ):
         self.timeout = timeout
         self.max_queue_size = max_queue_size
@@ -55,8 +57,11 @@ class LoggingWorker:
         self._last_aggressive_clear_time: float = 0.0
         self._aggressive_clear_in_progress: bool = False
 
-        # Register cleanup handler to flush remaining events on exit
-        atexit.register(self._flush_on_exit)
+        # Register cleanup handler to flush remaining events on exit.
+        # Disabled for per-loop instances owned by _PerLoopLoggingWorker, which
+        # registers a single atexit handler that flushes all of them.
+        if register_atexit:
+            atexit.register(self._flush_on_exit)
 
     def _ensure_queue(self) -> None:
         """Initialize the queue if it doesn't exist or if event loop has changed."""
@@ -529,5 +534,85 @@ class LoggingWorker:
             loop.close()
 
 
+class _PerLoopLoggingWorker:
+    """Dispatches LoggingWorker calls to a per-event-loop instance.
+
+    A single process can run several asyncio event loops concurrently when the
+    proxy is started in free-threading mode (``--run_free_threading`` runs one
+    event loop per server thread). ``asyncio.Queue`` / ``Semaphore`` / ``Task``
+    are loop-bound, so one shared ``LoggingWorker`` would constantly rebind and
+    thrash its queue across loops (manifesting as ``task_done() called too many
+    times`` and dropped log/callback tasks).
+
+    Keeping one ``LoggingWorker`` per running loop makes each loop's logging
+    self-contained, and the registry is guarded by a lock so it is safe under a
+    free-threaded (no-GIL) interpreter. In the common single-loop case there is
+    exactly one underlying worker, so behavior is unchanged.
+    """
+
+    def __init__(self, **worker_kwargs):
+        self._worker_kwargs = worker_kwargs
+        self._workers: Dict[asyncio.AbstractEventLoop, LoggingWorker] = {}
+        self._lock = threading.Lock()
+        atexit.register(self._flush_on_exit)
+
+    def _worker_for_current_loop(self, create: bool) -> Optional["LoggingWorker"]:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        with self._lock:
+            worker = self._workers.get(loop)
+            if worker is None and create:
+                worker = LoggingWorker(register_atexit=False, **self._worker_kwargs)
+                self._workers[loop] = worker
+            return worker
+
+    def start(self) -> None:
+        worker = self._worker_for_current_loop(create=True)
+        if worker is not None:
+            worker.start()
+
+    def enqueue(self, coroutine: Coroutine) -> None:
+        worker = self._worker_for_current_loop(create=False)
+        if worker is None:
+            return
+        worker.enqueue(coroutine)
+
+    def ensure_initialized_and_enqueue(self, async_coroutine: Coroutine) -> None:
+        worker = self._worker_for_current_loop(create=True)
+        if worker is None:
+            return
+        worker.ensure_initialized_and_enqueue(async_coroutine)
+
+    async def stop(self) -> None:
+        worker = self._worker_for_current_loop(create=False)
+        if worker is not None:
+            await worker.stop()
+
+    async def flush(self) -> None:
+        worker = self._worker_for_current_loop(create=False)
+        if worker is not None:
+            await worker.flush()
+
+    async def clear_queue(self) -> None:
+        worker = self._worker_for_current_loop(create=False)
+        if worker is not None:
+            await worker.clear_queue()
+            return
+        # Called from a fresh loop with no worker of its own (e.g. test
+        # cleanup via asyncio.run): best-effort drain of every loop's queue.
+        with self._lock:
+            workers = list(self._workers.values())
+        for other in workers:
+            await other.clear_queue()
+
+    def _flush_on_exit(self) -> None:
+        with self._lock:
+            workers = list(self._workers.values())
+        for worker in workers:
+            worker._flush_on_exit()
+
+
 # Global instance for backward compatibility
-GLOBAL_LOGGING_WORKER = LoggingWorker()
+GLOBAL_LOGGING_WORKER = _PerLoopLoggingWorker()
