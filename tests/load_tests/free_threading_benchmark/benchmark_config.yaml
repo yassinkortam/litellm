@@ -1,0 +1,24 @@
+# LiteLLM proxy config for the free-threading vs uvicorn-workers benchmark.
+#
+# Both models use `mock_response` so no upstream provider / API key is needed
+# and no network egress happens. This deliberately isolates the proxy's own
+# request-handling + serving overhead, which is exactly the variable that
+# differs between "4 uvicorn worker processes" and "4 free-threaded threads".
+model_list:
+  - model_name: bench-chat
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: sk-mock-not-used
+      mock_response: "Free-threading lets multiple Python threads run bytecode in parallel once the GIL is disabled. This fixed mock paragraph keeps the upstream model latency constant so the benchmark measures only the proxy serving layer differences between uvicorn worker processes and free-threaded server threads."
+
+  - model_name: bench-messages
+    litellm_params:
+      model: anthropic/claude-3-5-sonnet-latest
+      api_key: sk-mock-not-used
+      mock_response: "Free-threading lets multiple Python threads run bytecode in parallel once the GIL is disabled. This fixed mock paragraph keeps the upstream model latency constant so the benchmark measures only the proxy serving layer differences between uvicorn worker processes and free-threaded server threads."
+
+litellm_settings:
+  drop_params: true
+
+general_settings:
+  master_key: sk-benchmark-master-key

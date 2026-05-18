@@ -9,6 +9,7 @@ omits each feature's routes until the feature is warmed.
 import asyncio
 import importlib
 import sys
+import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Dict, Tuple
 
@@ -306,8 +307,27 @@ async def _force_load(app: "FastAPI", feat: LazyFeature) -> bool:
     if not hasattr(app.state, "lazy_loaded"):
         app.state.lazy_loaded = set()
         app.state.lazy_locks = {}
-    lock = app.state.lazy_locks.setdefault(feat.module_path, asyncio.Lock())
-    async with lock:
+    if feat.module_path in app.state.lazy_loaded:
+        return False
+    # threading.Lock (not asyncio.Lock): under --run_free_threading the proxy
+    # runs several event loops in one process, and an asyncio.Lock is bound to
+    # the loop that first awaits it ("bound to a different event loop"). A
+    # threading.Lock works across loops and threads.
+    #
+    # We never block on the lock (no asyncio.to_thread / blocking acquire):
+    # holding a pool thread while waiting would starve the executor that
+    # run_in_executor() needs for the import, deadlocking under load. Instead
+    # each caller either sees the feature already loaded, becomes the importer
+    # when the lock is free, or yields and re-checks — so callers still don't
+    # proceed to the route until the import has finished.
+    lock = app.state.lazy_locks.setdefault(feat.module_path, threading.Lock())
+    while True:
+        if feat.module_path in app.state.lazy_loaded:
+            return False
+        if lock.acquire(blocking=False):
+            break
+        await asyncio.sleep(0.02)
+    try:
         if feat.module_path in app.state.lazy_loaded:
             return False
         try:
@@ -337,6 +357,8 @@ async def _force_load(app: "FastAPI", feat: LazyFeature) -> bool:
                 exc,
             )
             return False
+    finally:
+        lock.release()
 
 
 def attach_lazy_features(app: "FastAPI") -> None:
