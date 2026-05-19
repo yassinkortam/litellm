@@ -1852,7 +1852,9 @@ class BaseLLMHTTPHandler:
         async_httpx_client: AsyncHTTPHandler,
         request_url: str,
         headers: dict,
-        signed_json_body: Optional[bytes],
+        # str when the caller passes a pre-serialized (unsigned) body to avoid
+        # re-dumping; bytes when a provider signed the request (e.g. Bedrock).
+        signed_json_body: Optional[Union[str, bytes]],
         request_body: dict,
         stream: bool,
         logging_obj: LiteLLMLoggingObj,
@@ -2043,8 +2045,18 @@ class BaseLLMHTTPHandler:
             model=model,
         )
 
+        # The request body was serialized once for the pre-call log input and
+        # again for the wire (json.dumps is O(payload), large for long-context
+        # Claude Code history). Serialize once and reuse for both. Only when
+        # the provider didn't sign the request (sign_request no-op for the
+        # native anthropic path -> signed_json_body is None); signed providers
+        # (e.g. Bedrock) keep their signed body untouched. The HTTP-error
+        # retry path mutates + re-signs the body, so it still re-serializes
+        # internally -- this only deduplicates the success path.
+        request_body_json = json.dumps(request_body)
+
         logging_obj.pre_call(
-            input=[{"role": "user", "content": json.dumps(request_body)}],
+            input=[{"role": "user", "content": request_body_json}],
             api_key="",
             additional_args={
                 "complete_input_dict": request_body,
@@ -2057,7 +2069,9 @@ class BaseLLMHTTPHandler:
             async_httpx_client=async_httpx_client,
             request_url=request_url,
             headers=headers,
-            signed_json_body=signed_json_body,
+            signed_json_body=(
+                signed_json_body if signed_json_body is not None else request_body_json
+            ),
             request_body=request_body,
             stream=stream or False,
             logging_obj=logging_obj,

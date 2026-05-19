@@ -467,3 +467,143 @@ def test_sync_delete_responses_omits_body_for_azure():
     assert captured["url"].endswith(
         "/openai/responses/resp_xyz?api-version=2025-03-01-preview"
     )
+
+
+# ---------------------------------------------------------------------------
+# Parity tests: request-body is serialized once and reused for the wire.
+# (_async_post_anthropic_messages_with_http_error_retry)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_anthropic_post_uses_prebuilt_body_without_redumping():
+    """When the caller passes a pre-serialized (unsigned) body, attempt 0 must
+    send exactly those bytes -- no second json.dumps of request_body."""
+    import json as _json
+
+    handler = BaseLLMHTTPHandler()
+    request_body = {"model": "claude", "messages": [{"role": "user", "content": "hi"}]}
+    prebuilt = _json.dumps(request_body)
+
+    ok_resp = Mock()
+    ok_resp.raise_for_status = Mock(return_value=None)
+    http_client = Mock()
+    http_client.post = AsyncMock(return_value=ok_resp)
+
+    provider_config = Mock()
+    provider_config.max_retry_on_anthropic_messages_http_error = 2
+
+    logging_obj = Mock()
+    logging_obj.model_call_details = {}
+
+    out = await handler._async_post_anthropic_messages_with_http_error_retry(
+        async_httpx_client=http_client,
+        request_url="http://x/v1/messages",
+        headers={},
+        signed_json_body=prebuilt,
+        request_body=request_body,
+        stream=False,
+        logging_obj=logging_obj,
+        provider_config=provider_config,
+        litellm_params=GenericLiteLLMParams(),
+        api_key="k",
+        model="claude",
+    )
+    assert out is ok_resp
+    http_client.post.assert_awaited_once()
+    sent = http_client.post.await_args.kwargs["data"]
+    # Byte-identical to the legacy wire serialization, and the SAME object the
+    # caller already used for the pre-call log (no re-serialization).
+    assert sent == prebuilt
+    assert sent is prebuilt
+
+
+@pytest.mark.asyncio
+async def test_anthropic_post_falls_back_to_json_dumps_when_unsigned_none():
+    """signed_json_body=None keeps the exact legacy behavior."""
+    import json as _json
+
+    handler = BaseLLMHTTPHandler()
+    request_body = {"model": "claude", "messages": [{"role": "user", "content": "yo"}]}
+
+    ok_resp = Mock()
+    ok_resp.raise_for_status = Mock(return_value=None)
+    http_client = Mock()
+    http_client.post = AsyncMock(return_value=ok_resp)
+
+    provider_config = Mock()
+    provider_config.max_retry_on_anthropic_messages_http_error = 1
+    logging_obj = Mock()
+    logging_obj.model_call_details = {}
+
+    await handler._async_post_anthropic_messages_with_http_error_retry(
+        async_httpx_client=http_client,
+        request_url="http://x/v1/messages",
+        headers={},
+        signed_json_body=None,
+        request_body=request_body,
+        stream=False,
+        logging_obj=logging_obj,
+        provider_config=provider_config,
+        litellm_params=GenericLiteLLMParams(),
+        api_key="k",
+        model="claude",
+    )
+    sent = http_client.post.await_args.kwargs["data"]
+    assert sent == _json.dumps(request_body)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_post_retry_reserializes_mutated_body():
+    """On a retryable HTTP error the body is mutated + re-signed; the prebuilt
+    body must NOT be reused -- attempt 1 sends the freshly serialized body."""
+    import json as _json
+
+    handler = BaseLLMHTTPHandler()
+    request_body = {"model": "claude", "messages": [{"role": "user", "content": "a"}]}
+    prebuilt = _json.dumps(request_body)
+
+    err_resp = Mock()
+    http_error = httpx.HTTPStatusError(
+        "bad", request=Mock(), response=Mock(status_code=400)
+    )
+    err_resp.raise_for_status = Mock(side_effect=http_error)
+    ok_resp = Mock()
+    ok_resp.raise_for_status = Mock(return_value=None)
+    http_client = Mock()
+    http_client.post = AsyncMock(side_effect=[err_resp, ok_resp])
+
+    def _mutate(e, request_data):
+        request_data["messages"][0]["content"] = "MUTATED"
+
+    provider_config = Mock()
+    provider_config.max_retry_on_anthropic_messages_http_error = 2
+    provider_config.should_retry_anthropic_messages_on_http_error = Mock(
+        return_value=True
+    )
+    provider_config.transform_anthropic_messages_request_on_http_error = _mutate
+    # Re-sign returns no signed body (native anthropic path) -> must re-dump.
+    provider_config.sign_request = Mock(return_value=({}, None))
+
+    logging_obj = Mock()
+    logging_obj.model_call_details = {}
+
+    await handler._async_post_anthropic_messages_with_http_error_retry(
+        async_httpx_client=http_client,
+        request_url="http://x/v1/messages",
+        headers={},
+        signed_json_body=prebuilt,
+        request_body=request_body,
+        stream=False,
+        logging_obj=logging_obj,
+        provider_config=provider_config,
+        litellm_params=GenericLiteLLMParams(),
+        api_key="k",
+        model="claude",
+    )
+    assert http_client.post.await_count == 2
+    first_sent = http_client.post.await_args_list[0].kwargs["data"]
+    second_sent = http_client.post.await_args_list[1].kwargs["data"]
+    assert first_sent == prebuilt  # attempt 0 used prebuilt
+    assert second_sent == _json.dumps(request_body)  # attempt 1 re-serialized
+    assert "MUTATED" in second_sent  # ... the mutated body
