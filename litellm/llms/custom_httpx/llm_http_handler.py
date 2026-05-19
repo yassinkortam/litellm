@@ -2079,6 +2079,14 @@ class BaseLLMHTTPHandler:
                 litellm_logging_obj=logging_obj,
             )
 
+            if not self._has_agentic_completion_hook(logging_obj):
+                # No callback overrides async_should_run_agentic_loop, so the
+                # agentic wrapper's only effect would be buffering every chunk
+                # and rebuilding the response from SSE at end-of-stream to call
+                # hooks that all return (False, {}). Stream through directly and
+                # skip that per-chunk + end-of-stream overhead.
+                return completion_stream
+
             from litellm.llms.anthropic.experimental_pass_through.messages.agentic_streaming_iterator import (
                 AgenticAnthropicStreamingIterator,
             )
@@ -4585,6 +4593,37 @@ class BaseLLMHTTPHandler:
         max_loops = int(kwargs.get("max_agentic_loops", 3) or 3)
         fingerprints = list(kwargs.get("_agentic_loop_fingerprints", []) or [])
         return depth, max(max_loops, 1), fingerprints
+
+    @staticmethod
+    def _has_agentic_completion_hook(logging_obj: Any) -> bool:
+        """
+        True if any registered callback actually overrides
+        ``async_should_run_agentic_loop`` (the gate every agentic hook goes
+        through). The base ``CustomLogger`` implementation returns
+        ``(False, {})``, so when nothing overrides it the agentic
+        post-processing is a guaranteed no-op and the streaming wrapper that
+        buffers + rebuilds the whole response from SSE just to call it can be
+        skipped entirely.
+
+        Function-identity comparison (not a leaf ``__dict__`` check) so an
+        override inherited through any intermediate class is still detected --
+        a false negative here would silently disable agentic features.
+        """
+        from litellm.integrations.custom_logger import CustomLogger
+
+        base_func = CustomLogger.async_should_run_agentic_loop
+        callbacks = litellm.callbacks + (
+            getattr(logging_obj, "dynamic_success_callbacks", None) or []
+        )
+        for cb in callbacks:
+            if not isinstance(cb, CustomLogger):
+                continue
+            cb_func = getattr(type(cb), "async_should_run_agentic_loop", base_func)
+            if getattr(cb_func, "__func__", cb_func) is not getattr(
+                base_func, "__func__", base_func
+            ):
+                return True
+        return False
 
     @staticmethod
     def _check_agentic_loop_safety(

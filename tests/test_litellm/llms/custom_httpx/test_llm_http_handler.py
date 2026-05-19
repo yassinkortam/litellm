@@ -101,6 +101,51 @@ def test_get_agentic_loop_settings_defaults_and_overrides():
     assert fingerprints == ["fp-1", "fp-2"]
 
 
+def test_has_agentic_completion_hook_detection(monkeypatch):
+    """The streaming path skips the agentic wrapper only when no callback
+    overrides async_should_run_agentic_loop. Verify both directions."""
+    from litellm.integrations.custom_logger import CustomLogger
+
+    handler = BaseLLMHTTPHandler()
+    logging_obj = Mock()
+    logging_obj.dynamic_success_callbacks = []
+
+    # No callbacks at all -> no agentic hook.
+    monkeypatch.setattr(litellm, "callbacks", [])
+    assert handler._has_agentic_completion_hook(logging_obj) is False
+
+    # A plain CustomLogger that does NOT override the gate -> still no hook
+    # (so the wrapper is safely skipped).
+    class _PlainLogger(CustomLogger):
+        pass
+
+    monkeypatch.setattr(litellm, "callbacks", [_PlainLogger()])
+    assert handler._has_agentic_completion_hook(logging_obj) is False
+
+    # A logger that overrides the gate (directly) -> hook present.
+    class _AgenticLogger(CustomLogger):
+        async def async_should_run_agentic_loop(
+            self, response, model, messages, tools, stream, custom_llm_provider, kwargs
+        ):
+            return True, {}
+
+    monkeypatch.setattr(litellm, "callbacks", [_AgenticLogger()])
+    assert handler._has_agentic_completion_hook(logging_obj) is True
+
+    # Override inherited through an intermediate class is still detected
+    # (function-identity check, not a leaf __dict__ check).
+    class _DerivedAgenticLogger(_AgenticLogger):
+        pass
+
+    monkeypatch.setattr(litellm, "callbacks", [_DerivedAgenticLogger()])
+    assert handler._has_agentic_completion_hook(logging_obj) is True
+
+    # Hook supplied via logging_obj.dynamic_success_callbacks is detected too.
+    monkeypatch.setattr(litellm, "callbacks", [])
+    logging_obj.dynamic_success_callbacks = [_AgenticLogger()]
+    assert handler._has_agentic_completion_hook(logging_obj) is True
+
+
 def test_fingerprint_agentic_tools_is_deterministic():
     handler = BaseLLMHTTPHandler()
     tools_a = {"tool_calls": [{"id": "1", "input": {"q": "abc"}, "name": "web_search"}]}
