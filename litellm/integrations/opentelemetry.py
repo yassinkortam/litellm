@@ -709,6 +709,11 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
                 key="exception",
                 value=str(original_exception),
             )
+            self._set_team_attributes_on_span(
+                span=exception_logging_span,
+                team_id=user_api_key_dict.team_id,
+                team_alias=user_api_key_dict.team_alias,
+            )
             exception_logging_span.set_status(Status(StatusCode.ERROR))
             exception_logging_span.end(end_time=self._to_ns(datetime.now()))
 
@@ -1070,7 +1075,39 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
         )
         raw_span.set_status(Status(StatusCode.OK))
         self.set_raw_request_attributes(raw_span, kwargs, response_obj)
+        self._set_team_attributes_from_kwargs(raw_span, kwargs)
         raw_span.end(end_time=self._to_ns(end_time))
+
+    def _set_team_attributes_on_span(
+        self,
+        span: Span,
+        team_id: Optional[str],
+        team_alias: Optional[str],
+    ) -> None:
+        """Stamp team_id / team_alias onto a span so every child span of a litellm_request trace carries them, not just the root span."""
+        if team_id is not None:
+            self.safe_set_attribute(
+                span=span,
+                key="metadata.user_api_key_team_id",
+                value=team_id,
+            )
+        if team_alias is not None:
+            self.safe_set_attribute(
+                span=span,
+                key="metadata.user_api_key_team_alias",
+                value=team_alias,
+            )
+
+    def _set_team_attributes_from_kwargs(self, span: Span, kwargs: dict) -> None:
+        """Pull team_id / team_alias from the standard logging metadata in kwargs and stamp them onto span."""
+        std_log = kwargs.get("standard_logging_object")
+        md = getattr(std_log, "metadata", None) or (std_log or {}).get("metadata", {})
+        md = md or {}
+        self._set_team_attributes_on_span(
+            span=span,
+            team_id=md.get("user_api_key_team_id"),
+            team_alias=md.get("user_api_key_team_alias"),
+        )
 
     def _record_metrics(self, kwargs, response_obj, start_time, end_time):
         duration_s = (end_time - start_time).total_seconds()
@@ -1531,6 +1568,8 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
                 key="guardrail_response",
                 value=guardrail_information.get("guardrail_response"),
             )
+
+            self._set_team_attributes_from_kwargs(guardrail_span, kwargs)
 
             guardrail_span.end(end_time=self._to_ns(end_time_datetime))
 
