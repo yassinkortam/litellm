@@ -53,9 +53,9 @@ def test_sagemaker_response_stream_shape_is_structure_shape():
 
     from litellm.llms.sagemaker.common_utils import SAGEMAKER_RESPONSE_STREAM_SHAPE
 
-    assert SAGEMAKER_RESPONSE_STREAM_SHAPE is not None, (
-        "SAGEMAKER_RESPONSE_STREAM_SHAPE is None — botocore may not be installed"
-    )
+    assert (
+        SAGEMAKER_RESPONSE_STREAM_SHAPE is not None
+    ), "SAGEMAKER_RESPONSE_STREAM_SHAPE is None — botocore may not be installed"
     shape: StructureShape = SAGEMAKER_RESPONSE_STREAM_SHAPE  # remove Optional
     assert isinstance(shape, StructureShape)
     assert shape.name == "InvokeEndpointWithResponseStreamOutput"

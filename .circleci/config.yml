@@ -111,6 +111,18 @@ commands:
       - wait_for_service:
           url: tcp://localhost:6379
           timeout: "60"
+  start_mock_openai_server:
+    description: "Start the local mock OpenAI server for CI tests (replaces Railway-hosted endpoint)"
+    steps:
+      - run:
+          name: Start Mock OpenAI Server
+          command: |
+            uv run --no-sync python tests/ci_mock_server/openai_mock_server.py --host 0.0.0.0 --port 8080 &
+            echo $! > /tmp/mock_openai_server.pid
+          background: true
+      - wait_for_service:
+          url: http://localhost:8080/health
+          timeout: "60"
   setup_litellm_enterprise_pip:
     steps:
       - run:
@@ -452,6 +464,13 @@ jobs:
           key: v1-uv-cache-{{ checksum "uv.lock" }}
       # Run pytest and generate JUnit XML report
       - setup_litellm_enterprise_pip
+      - run:
+          name: Start Mock OpenAI Server
+          command: |
+            uv run --no-sync python tests/ci_mock_server/openai_mock_server.py --host 127.0.0.1 --port 8080 &
+            sleep 3
+            curl -sf http://localhost:8080/health || exit 1
+          background: true
       - run:
           name: Run tests
           command: |
@@ -1477,6 +1496,7 @@ jobs:
           name: Install Dependencies
           command: |
             uv sync --frozen --all-groups --all-extras --python 3.12
+      - start_mock_openai_server
       - start_postgres
       - run:
           name: Load Docker Database Image
@@ -1642,6 +1662,7 @@ jobs:
           name: Install Dependencies
           command: |
             uv sync --frozen --all-groups --all-extras --python 3.12
+      - start_mock_openai_server
       - start_postgres
       - attach_workspace:
           at: ~/project

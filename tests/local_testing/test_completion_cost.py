@@ -2756,7 +2756,7 @@ def model_item():
         "litellm_params": {
             "model": "openai/my-fake-model",
             "api_key": "my-fake-key",
-            "api_base": "https://exampleopenaiendpoint-production.up.railway.app/",
+            "api_base": "http://localhost:8080/",
         },
         "model_info": {},
     }
