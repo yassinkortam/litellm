@@ -55,9 +55,9 @@ def test_bedrock_response_stream_shape_is_structure_shape():
 
     from litellm.llms.bedrock.common_utils import BEDROCK_RESPONSE_STREAM_SHAPE
 
-    assert BEDROCK_RESPONSE_STREAM_SHAPE is not None, (
-        "BEDROCK_RESPONSE_STREAM_SHAPE is None — botocore may not be installed"
-    )
+    assert (
+        BEDROCK_RESPONSE_STREAM_SHAPE is not None
+    ), "BEDROCK_RESPONSE_STREAM_SHAPE is None — botocore may not be installed"
     shape: StructureShape = BEDROCK_RESPONSE_STREAM_SHAPE  # remove Optional
     assert isinstance(shape, StructureShape)
     assert shape.name == "ResponseStream"
@@ -102,7 +102,10 @@ def test_bedrock_parse_message_from_event_raises_on_none_shape():
     from unittest.mock import MagicMock, patch
 
     import litellm.llms.bedrock.common_utils as mod
-    from litellm.llms.bedrock.common_utils import BedrockError, BedrockEventStreamDecoderBase
+    from litellm.llms.bedrock.common_utils import (
+        BedrockError,
+        BedrockEventStreamDecoderBase,
+    )
 
     decoder = BedrockEventStreamDecoderBase()
     mock_event = MagicMock()

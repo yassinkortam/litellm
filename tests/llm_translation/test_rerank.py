@@ -175,7 +175,7 @@ async def test_rerank_custom_api_base(version):
         "documents": ["hello", "world"],
     }
 
-    api_base = "https://exampleopenaiendpoint-production.up.railway.app/"
+    api_base = "http://localhost:8080/"
     if version == "v1":
         api_base += "v1/rerank"
 
@@ -200,10 +200,7 @@ async def test_rerank_custom_api_base(version):
         _url = mock_post.call_args.kwargs["url"]
         print("Arguments passed to API=", args_to_api)
         print("url = ", _url)
-        assert (
-            _url
-            == f"https://exampleopenaiendpoint-production.up.railway.app/{version}/rerank"
-        )
+        assert _url == f"http://localhost:8080/{version}/rerank"
 
         request_data = json.loads(args_to_api)
         assert request_data["query"] == expected_payload["query"]

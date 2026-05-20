@@ -26,7 +26,7 @@ def _create_router():
                 "model_name": "azure-model",
                 "litellm_params": {
                     "model": "openai/very-special-endpoint",
-                    "api_base": "https://exampleopenaiendpoint-production.up.railway.app/",
+                    "api_base": "http://localhost:8080/",
                     "api_key": "fake-key",
                 },
                 "model_info": {"id": "very-special-endpoint"},
@@ -35,7 +35,7 @@ def _create_router():
                 "model_name": "azure-model",
                 "litellm_params": {
                     "model": "openai/fast-endpoint",
-                    "api_base": "https://exampleopenaiendpoint-production.up.railway.app/",
+                    "api_base": "http://localhost:8080/",
                     "api_key": "fake-key",
                 },
                 "model_info": {"id": "fast-endpoint"},

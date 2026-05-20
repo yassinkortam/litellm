@@ -246,7 +246,7 @@ router = Router(
             "model_name": "fake-model",
             "litellm_params": {
                 "model": "openai/fake",
-                "api_base": "https://exampleopenaiendpoint-production.up.railway.app/",
+                "api_base": "http://localhost:8080/",
                 "api_key": "sk-12345",
             },
         }
