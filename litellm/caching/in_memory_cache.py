@@ -10,6 +10,7 @@ Has 4 methods:
 
 import json
 import sys
+import threading
 import time
 import heapq
 from typing import TYPE_CHECKING, Any, List, Optional
@@ -48,6 +49,11 @@ class InMemoryCache(BaseCache):
         self.cache_dict: dict = {}
         self.ttl_dict: dict = {}
         self.expiration_heap: list[tuple[float, str]] = []
+        # Re-entrant because set_cache -> evict_cache -> _remove_key all
+        # mutate shared state. On free-threaded (no-GIL) builds, heap
+        # operations on a shared list are not atomic and will corrupt
+        # the heap invariant under concurrent writers.
+        self._lock = threading.RLock()
 
     def check_value_size(self, value: Any):
         """
@@ -161,21 +167,22 @@ class InMemoryCache(BaseCache):
         if self.max_size_in_memory == 0:
             return  # Don't cache anything if max size is 0
 
-        # Always prune expired/outdated heap roots before inserting.
-        # This keeps expiration_heap bounded even when the live cache stays
-        # below max_size_in_memory and keys are reinserted after TTL expiry.
-        self.evict_cache()
         if not self.check_value_size(value):
             return
 
-        self.cache_dict[key] = value
-        if self.allow_ttl_override(key):  # if ttl is not set, set it to default ttl
-            if "ttl" in kwargs and kwargs["ttl"] is not None:
-                self.ttl_dict[key] = time.time() + float(kwargs["ttl"])
-                heapq.heappush(self.expiration_heap, (self.ttl_dict[key], key))
-            else:
-                self.ttl_dict[key] = time.time() + self.default_ttl
-                heapq.heappush(self.expiration_heap, (self.ttl_dict[key], key))
+        with self._lock:
+            # Always prune expired/outdated heap roots before inserting.
+            # This keeps expiration_heap bounded even when the live cache stays
+            # below max_size_in_memory and keys are reinserted after TTL expiry.
+            self.evict_cache()
+            self.cache_dict[key] = value
+            if self.allow_ttl_override(key):  # if ttl is not set, set it to default ttl
+                if "ttl" in kwargs and kwargs["ttl"] is not None:
+                    self.ttl_dict[key] = time.time() + float(kwargs["ttl"])
+                    heapq.heappush(self.expiration_heap, (self.ttl_dict[key], key))
+                else:
+                    self.ttl_dict[key] = time.time() + self.default_ttl
+                    heapq.heappush(self.expiration_heap, (self.ttl_dict[key], key))
 
     async def async_set_cache(self, key, value, **kwargs):
         self.set_cache(key=key, value=value, **kwargs)
@@ -191,11 +198,11 @@ class InMemoryCache(BaseCache):
         """
         Add value to set
         """
-        # get the value
-        init_value = self.get_cache(key=key) or set()
-        for val in value:
-            init_value.add(val)
-        self.set_cache(key, init_value, ttl=ttl)
+        with self._lock:
+            init_value = self.get_cache(key=key) or set()
+            for val in value:
+                init_value.add(val)
+            self.set_cache(key, init_value, ttl=ttl)
         return value
 
     def evict_element_if_expired(self, key: str) -> bool:
@@ -210,16 +217,18 @@ class InMemoryCache(BaseCache):
         return False
 
     def get_cache(self, key, **kwargs):
-        if key in self.cache_dict:
+        with self._lock:
+            if key not in self.cache_dict:
+                return None
             if self.evict_element_if_expired(key):
                 return None
             original_cached_response = self.cache_dict[key]
-            try:
-                cached_response = json.loads(original_cached_response)
-            except Exception:
-                cached_response = original_cached_response
-            return cached_response
-        return None
+        # JSON decode is pure / non-mutating, do it outside the lock
+        # so it doesn't serialize concurrent readers.
+        try:
+            return json.loads(original_cached_response)
+        except Exception:
+            return original_cached_response
 
     def batch_get_cache(self, keys: list, **kwargs):
         return_val = []
@@ -229,10 +238,12 @@ class InMemoryCache(BaseCache):
         return return_val
 
     def increment_cache(self, key, value: int, **kwargs) -> int:
-        # get the value
-        init_value = self.get_cache(key=key) or 0
-        value = init_value + value
-        self.set_cache(key, value, **kwargs)
+        # Atomic read-modify-write under the lock so concurrent increments
+        # on a free-threaded interpreter don't lose updates.
+        with self._lock:
+            init_value = self.get_cache(key=key) or 0
+            value = init_value + value
+            self.set_cache(key, value, **kwargs)
         return value
 
     async def async_get_cache(self, key, **kwargs):
@@ -246,10 +257,11 @@ class InMemoryCache(BaseCache):
         return return_val
 
     async def async_increment(self, key, value: float, **kwargs) -> float:
-        # get the value
-        init_value = await self.async_get_cache(key=key) or 0
-        value = init_value + value
-        await self.async_set_cache(key, value, **kwargs)
+        # Atomic under the lock — see increment_cache.
+        with self._lock:
+            init_value = self.get_cache(key=key) or 0
+            value = init_value + value
+            self.set_cache(key, value, **kwargs)
         return value
 
     async def async_increment_pipeline(
@@ -264,15 +276,17 @@ class InMemoryCache(BaseCache):
         return results
 
     def flush_cache(self):
-        self.cache_dict.clear()
-        self.ttl_dict.clear()
-        self.expiration_heap.clear()
+        with self._lock:
+            self.cache_dict.clear()
+            self.ttl_dict.clear()
+            self.expiration_heap.clear()
 
     async def disconnect(self):
         pass
 
     def delete_cache(self, key):
-        self._remove_key(key)
+        with self._lock:
+            self._remove_key(key)
 
     async def async_get_ttl(self, key: str) -> Optional[int]:
         """
@@ -284,6 +298,8 @@ class InMemoryCache(BaseCache):
         """
         Get the oldest n keys in the cache
         """
-        # sorted ttl dict by ttl
-        sorted_ttl_dict = sorted(self.ttl_dict.items(), key=lambda x: x[1])
+        with self._lock:
+            # snapshot under lock; sort outside
+            items = list(self.ttl_dict.items())
+        sorted_ttl_dict = sorted(items, key=lambda x: x[1])
         return [key for key, _ in sorted_ttl_dict[:n]]

@@ -173,6 +173,33 @@ test-integration: install-test-deps
 test-unit-helm: install-helm-unittest
 	helm unittest -f 'tests/*.yaml' deploy/charts/litellm-helm
 
+# ---------------------------------------------------------------------------
+# Free-threaded (no-GIL) benchmark
+# ---------------------------------------------------------------------------
+# Compares LiteLLM gateway throughput / TTFT / event-loop lag with the GIL
+# enabled vs. disabled. Requires a free-threaded Python 3.13t interpreter
+# on PATH (install with `uv python install 3.13t` or use the
+# python:3.13t-slim image). See tests/load_tests/free_threading_benchmark/README.md.
+
+bench-freethreaded:
+	$(UV_RUN) python tests/load_tests/free_threading_benchmark/run_benchmark.py \
+		--mode compare \
+		--duration 60 \
+		--concurrency 64 \
+		--out tests/load_tests/free_threading_benchmark/results
+
+bench-freethreaded-gil:
+	$(UV_RUN) python tests/load_tests/free_threading_benchmark/run_benchmark.py \
+		--mode single --gil on \
+		--duration 60 --concurrency 64 \
+		--out tests/load_tests/free_threading_benchmark/results
+
+bench-freethreaded-nogil:
+	$(UV_RUN) python tests/load_tests/free_threading_benchmark/run_benchmark.py \
+		--mode single --gil off \
+		--duration 60 --concurrency 64 \
+		--out tests/load_tests/free_threading_benchmark/results
+
 # LLM Translation testing targets
 test-llm-translation: install-test-deps
 	@echo "Running LLM translation tests..."

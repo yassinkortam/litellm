@@ -1,0 +1,96 @@
+# Free-threaded (no-GIL) build target for the LiteLLM proxy.
+#
+# Uses CPython 3.13t (the experimental free-threaded build, PEP 703).
+# Run with PYTHON_GIL=0 so the interpreter actually disables the GIL.
+#
+# This image is intended for benchmarking and early adopters. Some
+# C-extension dependencies in the LiteLLM stack do not yet ship
+# free-threaded wheels and may emit a "GIL was re-enabled because
+# extension X is not free-threaded compatible" warning at import.
+# That warning means the GIL silently came back on — verify at startup
+# with `python -c "import sys; print(sys._is_gil_enabled())"`.
+#
+# Build:
+#   docker build -f Dockerfile.freethreaded -t litellm-freethreaded .
+# Run:
+#   docker run -e PYTHON_GIL=0 -p 4000:4000 litellm-freethreaded \
+#       --config /app/config.yaml --num_workers 1
+
+ARG PYTHON_IMAGE=python:3.13.1-slim-bookworm
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.11.7@sha256:240fb85ab0f263ef12f492d8476aa3a2e4e1e333f7d67fbdd923d00a506a516a
+
+FROM $UV_IMAGE AS uvbin
+
+# ---- builder stage ----
+FROM $PYTHON_IMAGE AS builder
+
+WORKDIR /app
+
+COPY --from=uvbin /uv /usr/local/bin/uv
+COPY --from=uvbin /uvx /usr/local/bin/uvx
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash \
+        build-essential \
+        ca-certificates \
+        curl \
+        libsndfile1 \
+        openssl \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the free-threaded interpreter from python.org's deb-style tarball is
+# not yet straightforward; instead we use uv to fetch a pre-built free-threaded
+# CPython into the project venv. uv understands the `t` suffix.
+RUN uv python install 3.13t
+
+ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
+    UV_LINK_MODE=copy \
+    PATH="/app/.venv/bin:${PATH}"
+
+COPY pyproject.toml uv.lock ./
+COPY enterprise/pyproject.toml enterprise/
+COPY litellm-proxy-extras/pyproject.toml litellm-proxy-extras/
+
+# Resolve and install against 3.13t. We deliberately drop --frozen here:
+# the lockfile was pinned for the GIL-enabled interpreter and some wheels
+# need free-threading-compatible variants that resolve differently.
+RUN uv sync --no-install-project --no-install-workspace --no-default-groups --no-editable \
+    --extra proxy \
+    --extra proxy-runtime \
+    --extra extra_proxy \
+    --python 3.13t
+
+COPY . .
+
+RUN uv sync --no-default-groups --no-editable \
+    --extra proxy \
+    --extra proxy-runtime \
+    --extra extra_proxy \
+    --python 3.13t
+
+# ---- runtime stage ----
+FROM $PYTHON_IMAGE AS runtime
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        libsndfile1 \
+        openssl \
+        tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/app/.venv/bin:${PATH}" \
+    PYTHON_GIL=0 \
+    LITELLM_FREE_THREADED=1
+
+COPY --from=builder /app /app
+COPY docker/freethreaded_entrypoint.sh /usr/local/bin/freethreaded_entrypoint.sh
+RUN chmod +x /usr/local/bin/freethreaded_entrypoint.sh
+
+EXPOSE 4000/tcp
+
+ENTRYPOINT ["/usr/local/bin/freethreaded_entrypoint.sh"]
+CMD ["--port", "4000"]
